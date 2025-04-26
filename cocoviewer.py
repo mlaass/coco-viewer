@@ -36,16 +36,17 @@ class Data:
 
     def __init__(self, image_dir, annotations_file):
         self.image_dir = image_dir
-        instances, images, categories = parse_coco(annotations_file)
+        instances, images, categories, validation = parse_coco(annotations_file)
         self.instances = instances
         self.images = ImageList(images)  # NOTE: image list is based on annotations file
         self.categories = categories  # Dataset categories
+        self.validation = validation  # Store validation data if present
 
         # Prepare the very first image
         self.current_image = self.images.next()  # Set the first image as current
 
     def prepare_image(self, object_based_coloring: bool = False):
-        """Prepares image path, objects, colors."""
+        """Prepares image path, objects, colors, and validation status."""
         # TODO: predicted bboxes drawing (from models)
         img_id, img_name = self.current_image
         full_path = os.path.join(self.image_dir, img_name)
@@ -53,6 +54,29 @@ class Data:
         # Get objects and category ids
         objects = [obj for obj in self.instances["annotations"] if obj["image_id"] == img_id]
         obj_categories_ids = [obj["category_id"] for obj in objects]
+
+        # --- Validation Logic Start ---
+        obj_validation_status = []
+        obj_validated_bool_status = []  # New list for 'validated' boolean
+        if self.validation:
+            # Create a lookup for faster access: annotation_id -> (is_correct, validated)
+            validation_lookup = {
+                v["annotation_id"]: (v.get("is_correct"), v.get("validated"))
+                for v in self.validation
+                if v["image_id"] == img_id
+            }
+            for obj in objects:
+                status = validation_lookup.get(obj["id"])
+                if status:
+                    obj_validation_status.append(status[0])
+                    obj_validated_bool_status.append(status[1])
+                else:
+                    obj_validation_status.append(None)
+                    obj_validated_bool_status.append(None)
+        else:
+            obj_validation_status = [None] * len(objects)
+            obj_validated_bool_status = [None] * len(objects)
+        # --- Validation Logic End ---
 
         # List of category ids of all objects
         img_obj_categories = [obj["category_id"] for obj in objects]
@@ -75,7 +99,15 @@ class Data:
 
             names_colors = names_colors_obj
 
-        return full_path, objects, names_colors, img_obj_categories, img_categories
+        return (
+            full_path,
+            objects,
+            names_colors,
+            img_obj_categories,
+            img_categories,
+            obj_validation_status,
+            obj_validated_bool_status,
+        )
 
     def next_image(self):
         """Loads the next image in a list."""
@@ -91,7 +123,8 @@ def parse_coco(annotations_file: str) -> tuple:
     instances = load_annotations(annotations_file)
     images = get_images(instances)
     categories = get_categories(instances)
-    return instances, images, categories
+    validation = instances.get("validation", None)  # Get validation field if present
+    return instances, images, categories, validation
 
 
 def load_annotations(fname: str) -> dict:
@@ -148,8 +181,21 @@ def get_categories(instances: dict) -> dict:
     return categories
 
 
-def draw_bboxes(draw, objects, labels, obj_categories, ignore, width, label_size):
+def draw_bboxes(
+    draw,
+    objects,
+    labels,
+    obj_categories,
+    ignore,
+    width,
+    label_size,
+    obj_validation_status=None,
+    obj_validated_bool_status=None,
+):
     """Puts rectangles on the image."""
+    obj_validation_status = obj_validation_status or [None] * len(objects)
+    obj_validated_bool_status = obj_validated_bool_status or [None] * len(objects)
+
     # Extracting bbox coordinates
     bboxes = [
         [
@@ -161,12 +207,37 @@ def draw_bboxes(draw, objects, labels, obj_categories, ignore, width, label_size
         for obj in objects
     ]
     # Draw bboxes
-    for i, (c, b) in enumerate(zip(obj_categories, bboxes)):
+    for i, (c, b, validation_status, validated_bool) in enumerate(
+        zip(obj_categories, bboxes, obj_validation_status, obj_validated_bool_status)
+    ):
         if i not in ignore:
             draw.rectangle(b, outline=c[-1], width=width)
 
             if labels:
                 text = c[0]
+                # Append validation status (is_correct)
+                correctness_symbol = ""
+                correctness_color = (255, 255, 255)
+                if validation_status is not None:
+                    if validation_status:
+                        correctness_symbol = " ✓"
+                        correctness_color = (0, 200, 0)  # Green for correct
+                    else:
+                        correctness_symbol = " ✗"
+                        correctness_color = (200, 0, 0)  # Red for incorrect
+
+                # Append validated boolean status
+                validated_symbol = ""
+                validated_color = (255, 255, 255)
+                if validated_bool is True:
+                    validated_symbol = " ✔"  # Heavy check mark
+                    validated_color = (0, 150, 255)  # Blue for validated
+                elif validated_bool is False:
+                    validated_symbol = " ❓"  # Question mark
+                    validated_color = (200, 150, 0)  # Orange for not validated
+
+                # Combine text parts
+                text += correctness_symbol + validated_symbol
 
                 try:
                     try:
@@ -180,7 +251,10 @@ def draw_bboxes(draw, objects, labels, obj_categories, ignore, width, label_size
                     # TODO: Implement notification message as popup window
                     font = ImageFont.load_default()
 
-                tw, th = draw.textsize(text, font)
+                # Use textbbox instead of textsize (deprecated in Pillow 10.0.0)
+                bbox_text = draw.textbbox((0, 0), text, font=font)
+                tw = bbox_text[2] - bbox_text[0]  # right - left
+                th = bbox_text[3] - bbox_text[1]  # bottom - top
                 tx0 = b[0]
                 ty0 = b[1] - th
 
@@ -197,7 +271,26 @@ def draw_bboxes(draw, objects, labels, obj_categories, ignore, width, label_size
                     tx1 = tw if tx0 == 0 else b[2]
 
                 draw.rectangle((tx0, ty0, tx1, ty1), fill=c[-1])
-                draw.text((tx0, ty0), text, (255, 255, 255), font=font)
+
+                # Draw text potentially in multiple parts with different colors
+                current_x = tx0
+                # Draw category name
+                cat_name = c[0]
+                bbox_cat_name = draw.textbbox((0, 0), cat_name, font=font)
+                tw_cat_name = bbox_cat_name[2] - bbox_cat_name[0]
+                draw.text((current_x, ty0), cat_name, (255, 255, 255), font=font)
+                current_x += tw_cat_name
+
+                # Draw correctness symbol
+                if correctness_symbol:
+                    bbox_correctness = draw.textbbox((0, 0), correctness_symbol, font=font)
+                    tw_correctness = bbox_correctness[2] - bbox_correctness[0]
+                    draw.text((current_x, ty0), correctness_symbol, correctness_color, font=font)
+                    current_x += tw_correctness
+
+                # Draw validated symbol
+                if validated_symbol:
+                    draw.text((current_x, ty0), validated_symbol, validated_color, font=font)
 
 
 def draw_masks(draw, objects, obj_categories, ignore, alpha):
@@ -327,6 +420,29 @@ class ImagePanel(ttk.Frame):
 
         self.reset()
         self._rootwindow.bind("<Configure>", self.on_resize)
+
+        # --- Panning Logic ---
+        self._canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self._canvas.bind("<B1-Motion>", self.on_move_press)
+        self._canvas.bind("<ButtonRelease-1>", self.on_button_release)
+        self.start_x = None
+        self.start_y = None
+        # --- End Panning Logic ---
+
+    def on_button_press(self, event):
+        # Record the starting position and change cursor
+        self._canvas.scan_mark(event.x, event.y)
+        self._canvas.config(cursor="fleur")
+        # Also set focus
+        self._canvas.focus_set()
+
+    def on_move_press(self, event):
+        # Drag the canvas view
+        self._canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def on_button_release(self, event):
+        # Reset cursor
+        self._canvas.config(cursor="")
 
     def reset(self, canvwidth=None, canvheight=None, bg=None):
         """Adjusts canvas and scrollbars according to given canvas size."""
@@ -505,6 +621,10 @@ class SlidersBar(ttk.Frame):
         self.mask_slider = tk.Scale(self, label="mask", from_=0, to=255, tickinterval=50, orient=tk.HORIZONTAL)
         self.mask_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        # Zoom level controller
+        self.zoom_slider = tk.Scale(self, label="zoom (%)", from_=10, to=400, tickinterval=50, orient=tk.HORIZONTAL)
+        self.zoom_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
 
 class Controller:
     def __init__(self, data, root, image_panel, statusbar, menu, objects_panel, sliders):
@@ -578,11 +698,17 @@ class Controller:
         self.sliders.label_slider.configure(variable=self.label_size, command=lambda e: self.update_img())
         self.sliders.mask_slider.configure(variable=self.mask_alpha, command=lambda e: self.update_img())
 
+        # Zoom slider setup
+        self.zoom_level = tk.IntVar()
+        self.zoom_level.set(100)
+        self.sliders.zoom_slider.configure(variable=self.zoom_level, command=lambda e: self.update_img())
+
         # Bind all events
         self.bind_events()
 
         # Compose the very first image
         self.current_composed_image = None
+        self.original_composed_image = None  # Store the unzoomed image
         self.current_img_obj_categories = None
         self.current_img_categories = None
         self.update_img()
@@ -608,6 +734,8 @@ class Controller:
         width: int = 1,
         alpha: int = 128,
         label_size: int = 15,
+        obj_validation_status: list = None,
+        obj_validated_bool_status: list = None,
     ):
         ignore = ignore or []  # list of objects to ignore
         img_open, draw_layer, draw = open_image(full_path)
@@ -616,10 +744,20 @@ class Controller:
             draw_masks(draw, objects, names_colors, ignore, alpha)
         # Draw bounding boxes
         if bboxes_on:
-            draw_bboxes(draw, objects, labels_on, names_colors, ignore, width, label_size)
+            draw_bboxes(
+                draw,
+                objects,
+                labels_on,
+                names_colors,
+                ignore,
+                width,
+                label_size,
+                obj_validation_status,
+                obj_validated_bool_status,
+            )
         del draw
         # Resulting image
-        self.current_composed_image = Image.alpha_composite(img_open, draw_layer)
+        self.original_composed_image = Image.alpha_composite(img_open, draw_layer)
 
     def update_img(self, local=True, width=None, alpha=None, label_size=None):
         """Triggers image composition and sets composed image as current."""
@@ -635,6 +773,8 @@ class Controller:
             names_colors,
             img_obj_categories,
             img_categories,
+            obj_validation_status,
+            obj_validated_bool_status,
         ) = self.data.prepare_image(coloring)
         self.current_img_obj_categories = img_obj_categories
         self.current_img_categories = img_categories
@@ -648,6 +788,13 @@ class Controller:
         alpha = self.mask_alpha.get() if alpha is None else alpha
         label_size = self.label_size.get() if label_size is None else label_size
 
+        # --- Zoom Adjustment for Font Size ---
+        zoom_factor = self.zoom_level.get() / 100.0
+        if zoom_factor <= 0:
+            zoom_factor = 0.01  # Prevent division by zero or negative
+        adjusted_label_size = max(1, int(label_size / zoom_factor))
+        # --- End Zoom Adjustment ---
+
         # Compose image
         self.compose_image(
             full_path=full_path,
@@ -659,18 +806,28 @@ class Controller:
             ignore=ignore,
             width=width,
             alpha=alpha,
-            label_size=label_size,
+            label_size=adjusted_label_size,
+            obj_validation_status=obj_validation_status,
+            obj_validated_bool_status=obj_validated_bool_status,
         )
 
+        # --- Zoom Logic Start ---
+        orig_w, orig_h = self.original_composed_image.size
+
+        new_w = max(1, int(orig_w * zoom_factor))
+        new_h = max(1, int(orig_h * zoom_factor))
+
+        # Use NEAREST for fastest resizing
+        img_resized = self.original_composed_image.resize((new_w, new_h), Image.Resampling.NEAREST)
+        # --- Zoom Logic End ---
+
         # Prepare PIL image for Tkinter
-        img = self.current_composed_image
-        w, h = img.size
-        img = ImageTk.PhotoImage(img)
+        img_tk = ImageTk.PhotoImage(img_resized)
 
         # Set image as current
-        self.image_panel.create_image(0, 0, image=img)
-        self.image_panel.image = img
-        self.image_panel.reset(canvwidth=w, canvheight=h)
+        self.image_panel.create_image(0, 0, image=img_tk)
+        self.image_panel.image = img_tk
+        self.image_panel.reset(canvwidth=new_w, canvheight=new_h)
 
         # Update statusbar vars
         self.file_count_status.set(f"{str(self.data.images.n + 1)}/{self.data.images.max}")
@@ -716,7 +873,7 @@ class Controller:
         )
         # If not canceled:
         if file:
-            self.current_composed_image.save(file)
+            self.original_composed_image.save(file)
 
     def menu_view_bboxes(self):
         self.bboxes_on_local = self.bboxes_on_global.get()
@@ -864,7 +1021,33 @@ class Controller:
         # Objects Panel
         self.objects_panel.category_box.bind("<<ListboxSelect>>", self.select_category)
         self.objects_panel.object_box.bind("<<ListboxSelect>>", self.select_object)
-        self.image_panel.bind("<Button-1>", lambda e: self.image_panel.focus_set())
+
+        # Mouse Wheel Zoom on Image Panel
+        # Linux
+        self.image_panel._canvas.bind("<Button-4>", self.handle_zoom_scroll)
+        self.image_panel._canvas.bind("<Button-5>", self.handle_zoom_scroll)
+        # Windows/macOS
+        self.image_panel._canvas.bind("<MouseWheel>", self.handle_zoom_scroll)
+
+    def handle_zoom_scroll(self, event):
+        """Handles mouse wheel scrolling for zooming."""
+        zoom_step = 10  # Zoom increment/decrement percentage
+        current_zoom = self.zoom_level.get()
+        min_zoom, max_zoom = self.sliders.zoom_slider.cget("from"), self.sliders.zoom_slider.cget("to")
+
+        # Determine scroll direction
+        if event.num == 4 or event.delta > 0:  # Scroll Up
+            new_zoom = current_zoom + zoom_step
+        elif event.num == 5 or event.delta < 0:  # Scroll Down
+            new_zoom = current_zoom - zoom_step
+        else:
+            return  # Should not happen
+
+        # Clamp zoom level and update
+        new_zoom = max(min_zoom, min(new_zoom, max_zoom))
+        if new_zoom != current_zoom:
+            self.zoom_level.set(new_zoom)
+            self.update_img()  # Update image with new zoom
 
 
 def print_info(message: str):
